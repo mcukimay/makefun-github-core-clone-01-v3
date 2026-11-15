@@ -15,7 +15,11 @@ if (ENV_URL === '') {
 }
 
 const REQUEST_BUDGET_MS = 30_000;
-const BACKOFF_FIRST_MS = 250;
+// First retry after 150 ms, not 200: the register loop's first retry is the
+// common cold-start path (the suite is usually up by the second attempt), and
+// 150 ms is still well above the suite's startup jitter — it shaves 50 ms off
+// the boot-to-registered latency without risking a retry storm.
+const BACKOFF_FIRST_MS = 150;
 const BACKOFF_CAP_MS = 2_000;
 
 function nap(ms: number): Promise<void> {

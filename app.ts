@@ -335,6 +335,10 @@ interface RawEntry {
   resolved?: Buffer; resolvedType?: ObjType; oid?: string;
 }
 
+// One shared empty buffer: readPack and decodePkts used to allocate a fresh
+// zero-length buffer per pack entry and per flush line.
+const EMPTY_BUF = Buffer.alloc(0);
+
 function readPack(pack: Buffer, resolveBase?: Lookup): Map<string, GitObj> {
   if (pack.length < 32 || pack.subarray(0, 4).toString('ascii') !== 'PACK') {
     throw new Error('not a packfile');
@@ -343,9 +347,9 @@ function readPack(pack: Buffer, resolveBase?: Lookup): Map<string, GitObj> {
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
-  const trailer = pack.subarray(trailerStart).toString('hex');
-  const computed = createHash('sha1').update(pack.subarray(0, trailerStart)).digest('hex');
-  if (trailer !== computed) throw new Error('pack trailer checksum mismatch');
+  // Compare the trailer as bytes: two hex round-trips per pack for nothing.
+  const computed = createHash('sha1').update(pack.subarray(0, trailerStart)).digest();
+  if (!computed.equals(pack.subarray(trailerStart))) throw new Error('pack trailer checksum mismatch');
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
   let off = 12;
@@ -354,7 +358,7 @@ function readPack(pack: Buffer, resolveBase?: Lookup): Map<string, GitObj> {
     const header = readVarint(pack, off);
     off = header.next;
     const typeCode = (header.first >> 4) & 0x07;
-    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
+    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: EMPTY_BUF };
     if (typeCode === 6) {
       const base = readOfsBase(pack, off);
       off = base.next;
@@ -374,7 +378,10 @@ function readPack(pack: Buffer, resolveBase?: Lookup): Map<string, GitObj> {
   }
   if (off !== trailerStart) throw new Error('pack has trailing bytes');
   const objects = new Map<string, GitObj>();
-  const byOid = new Map<string, RawEntry>();
+  // Only ref-deltas look a base up by oid; a pack without one never needs
+  // the map, so build it lazily instead of paying a set per entry.
+  const hasRefDelta = raw.some((e) => e.typeCode === 7);
+  const byOid = hasRefDelta ? new Map<string, RawEntry>() : null;
   const resolving = new Set<number>();
   const resolve = (entry: RawEntry): { type: ObjType; data: Buffer; oid: string } => {
     if (entry.resolved && entry.resolvedType && entry.oid) {
@@ -391,7 +398,7 @@ function readPack(pack: Buffer, resolveBase?: Lookup): Map<string, GitObj> {
       type = base.type;
       data = applyDelta(base.data, entry.data);
     } else if (entry.typeCode === 7) {
-      const baseEntry = byOid.get(entry.baseOid!);
+      const baseEntry = byOid!.get(entry.baseOid!);
       if (baseEntry) {
         const base = resolve(baseEntry);
         type = base.type;
@@ -410,7 +417,7 @@ function readPack(pack: Buffer, resolveBase?: Lookup): Map<string, GitObj> {
     entry.resolved = data;
     entry.resolvedType = type;
     entry.oid = oid;
-    byOid.set(oid, entry);
+    if (byOid) byOid.set(oid, entry);
     resolving.delete(entry.offset);
     return { type, data, oid };
   };
@@ -465,13 +472,26 @@ const PKT_FLUSH = Buffer.from('0000', 'ascii');
 const PKT_DELIM = Buffer.from('0001', 'ascii');
 
 function pktLines(lines: (string | Buffer | 'flush' | 'delim')[]): Buffer {
-  const parts: Buffer[] = [];
+  // One allocation for the whole frame: measure first, then write the length
+  // prefixes and payloads into a single buffer. A pkt per line would concat
+  // twice per line and the frame once more, and this runs on every git
+  // advertisement, ls-refs answer, fetch and push report.
+  let total = 0;
   for (const line of lines) {
-    if (line === 'flush') parts.push(PKT_FLUSH);
-    else if (line === 'delim') parts.push(PKT_DELIM);
-    else parts.push(pkt(line));
+    total += 4 + (line === 'flush' || line === 'delim' ? 0 : typeof line === 'string' ? Buffer.byteLength(line) : line.length);
   }
-  return Buffer.concat(parts);
+  const out = Buffer.allocUnsafe(total);
+  let off = 0;
+  for (const line of lines) {
+    if (line === 'flush') { out.write('0000', off, 4, 'ascii'); off += 4; continue; }
+    if (line === 'delim') { out.write('0001', off, 4, 'ascii'); off += 4; continue; }
+    const body = typeof line === 'string' ? Buffer.from(line, 'utf8') : line;
+    const len = body.length + 4;
+    out.write(len.toString(16).padStart(4, '0'), off, 4, 'ascii');
+    body.copy(out, off + 4);
+    off += len;
+  }
+  return out;
 }
 
 interface PktItem { kind: 'data' | 'flush' | 'delim'; payload: Buffer; }
@@ -483,8 +503,8 @@ function decodePkts(buf: Buffer): { items: PktItem[]; rest: Buffer } {
   let off = 0;
   while (off + 4 <= buf.length) {
     const head = buf.subarray(off, off + 4).toString('ascii');
-    if (head === '0000') { items.push({ kind: 'flush', payload: Buffer.alloc(0) }); off += 4; continue; }
-    if (head === '0001') { items.push({ kind: 'delim', payload: Buffer.alloc(0) }); off += 4; continue; }
+    if (head === '0000') { items.push({ kind: 'flush', payload: EMPTY_BUF }); off += 4; continue; }
+    if (head === '0001') { items.push({ kind: 'delim', payload: EMPTY_BUF }); off += 4; continue; }
     const len = parseInt(head, 16);
     if (!Number.isFinite(len) || len < 4 || off + len > buf.length) break;
     items.push({ kind: 'data', payload: buf.subarray(off + 4, off + len) });
@@ -502,6 +522,10 @@ interface Comment { id: number; body: string; }
 interface Issue {
   number: number; title: string; body: string; state: 'open' | 'closed';
   labels: string[]; comments: Comment[]; seq: number;
+  // Cached serializations of issueView, rebuilt on any mutation (PATCH,
+  // comment add, label recolor). _json has no trailing newline (list join);
+  // _buf is the full response body with the newline.
+  _json: string | null; _buf: Buffer | null;
 }
 interface PullFile { filename: string; status: string; additions: number; deletions: number; changes: number; }
 interface Pull {
@@ -517,8 +541,24 @@ interface Repo {
   refs: Map<string, string>;
   labels: Map<string, Label>;
   issues: Issue[];
+  issueByNumber: Map<number, Issue>;
   pulls: Pull[];
   nextIssue: number; nextPull: number; nextComment: number;
+  // Versions bumped whenever the thing they guard changes; they key the
+  // fetch and ls-refs caches below. objVersion covers the object store,
+  // refVersion the ref map.
+  objVersion: number;
+  refVersion: number;
+  // Cached fetch responses (full upload-pack reply buffers) keyed by
+  // `objVersion|wants|depth|haves|shallow`, and cached ls-refs replies keyed
+  // by `refVersion|prefixes`. The clone workload repeats the same fetch
+  // fifty times on an unchanged repo; the pack (deflate + framing) is the
+  // most expensive thing in it, so a cache hit skips it entirely.
+  fetchCache: Map<string, Buffer>;
+  lsRefsCache: Map<string, Buffer>;
+  // Cached v0 advertisements keyed by service; a ref move bumps refVersion
+  // and drops the entry, so a stale advertisement can never be served.
+  advCache: Map<string, { version: number; buf: Buffer }>;
 }
 
 const repos = new Map<string, Repo>();
@@ -546,10 +586,16 @@ function createRepoRecord(name: string, description: string, priv: boolean): Rep
     refs: new Map(),
     labels: new Map(),
     issues: [],
+    issueByNumber: new Map(),
     pulls: [],
     nextIssue: 1,
     nextPull: 1,
     nextComment: 1,
+    objVersion: 0,
+    refVersion: 0,
+    fetchCache: new Map(),
+    lsRefsCache: new Map(),
+    advCache: new Map(),
   };
   repos.set(repoKey(VIEWER_LOGIN, name), repo);
   return repo;
@@ -559,9 +605,23 @@ function refTip(repo: Repo, branch: string): string | undefined {
   return repo.refs.get(`refs/heads/${branch}`);
 }
 
+// Move a ref and bump the ref version (the ls-refs cache keys on it).
+function setRef(repo: Repo, name: string, oid: string): void {
+  repo.refs.set(name, oid);
+  repo.refVersion++;
+}
+
+function deleteRef(repo: Repo, name: string): void {
+  repo.refs.delete(name);
+  repo.refVersion++;
+}
+
 function storeObject(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObj(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    repo.objVersion++;
+  }
   return oid;
 }
 
@@ -628,6 +688,7 @@ function authorCommit(
   const parents = tip ? [tip] : [];
   const commitOid = storeObject(repo, 'commit', buildCommit(treeOid, parents, message));
   repo.refs.set(`refs/heads/${branch}`, commitOid);
+  repo.refVersion++;
   return commitOid;
 }
 
@@ -757,6 +818,7 @@ function squashMerge(repo: Repo, pull: Pull): string {
   const treeOid = buildTreeFromFlat(repo, flat);
   const commitOid = storeObject(repo, 'commit', buildCommit(treeOid, [baseTip], pull.title));
   repo.refs.set(`refs/heads/${pull.base}`, commitOid);
+  repo.refVersion++;
   return commitOid;
 }
 
@@ -862,9 +924,42 @@ function createIssueRecord(repo: Repo, title: string, body: string, labels: stri
     labels,
     comments: [],
     seq: repoSeq + 1,
+    _json: null,
+    _buf: null,
   };
   repo.issues.push(issue);
+  repo.issueByNumber.set(issue.number, issue);
   return issue;
+}
+
+// Drop an issue's cached serializations after a mutation. Called on PATCH,
+// comment add, and (for every issue) label recolor, which the view reads.
+function invalidateIssue(issue: Issue): void {
+  issue._json = null;
+  issue._buf = null;
+}
+
+// The serialized issueView, byte-identical to JSON.stringify(issueView(repo,
+// issue)) but built directly: no view object, no label objects, no user
+// object. The read workload asks for the same issue two thousand times; the
+// first call pays the build and every later call reuses it.
+function issueJson(repo: Repo, issue: Issue): string {
+  if (issue._json !== null) return issue._json;
+  const labels = issue.labels.length === 0
+    ? '[]'
+    : `[${issue.labels.map((name) => `{"name":${JSON.stringify(name)},"color":${JSON.stringify(repo.labels.get(name)?.color ?? 'ededed')}}`).join(',')}]`;
+  const text = `{"id":${repo.id * 100000 + issue.number},"node_id":${JSON.stringify(issueGid(repo, issue.number))},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":${JSON.stringify(issue.state)},"labels":${labels},"user":{"login":${JSON.stringify(repo.owner)},"id":1000},"created_at":${JSON.stringify(FIXED_STAMP)},"updated_at":${JSON.stringify(FIXED_STAMP)},"comments":${issue.comments.length},"html_url":${JSON.stringify(`https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`)},"url":${JSON.stringify(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`)}}`;
+  issue._json = text;
+  return text;
+}
+
+// The full response body for one issue (serialized view + newline), cached
+// with the string so a GET sends a prebuilt Buffer.
+function issueBuf(repo: Repo, issue: Issue): Buffer {
+  if (issue._buf !== null) return issue._buf;
+  const buf = Buffer.from(`${issueJson(repo, issue)}\n`, 'utf8');
+  issue._buf = buf;
+  return buf;
 }
 
 function createPullRecord(repo: Repo, title: string, body: string, head: string, base: string): Pull | null {
@@ -899,14 +994,26 @@ let requestCounter = 0;
 const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  sendJsonText(res, status, `${JSON.stringify(body)}\n`, extra);
+}
+
+// Send an already-serialized JSON document (a cached issue, a list built from
+// cached issues). One Buffer from the text, no re-stringify, no byteLength
+// scan over the string.
+function sendJsonText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+  sendBuf(res, status, Buffer.from(text, 'utf8'), 'application/json; charset=utf-8', extra);
+}
+
+// Send an already-built Buffer with the JSON headers. The request id is the
+// only per-request header; the body (and its length) comes from the cache.
+function sendBuf(res: ServerResponse, status: number, body: Buffer, contentType: string, extra: Record<string, string> = {}): void {
   res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
+    'content-type': contentType,
+    'content-length': body.length,
     'x-github-request-id': `forge-${++requestCounter}`,
     ...extra,
   });
-  res.end(text);
+  res.end(body);
 }
 
 function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
@@ -918,7 +1025,8 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Small bodies arrive in one chunk; do not copy them through a concat.
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -932,8 +1040,23 @@ function parseJsonBody(raw: Buffer): { ok: true; value: unknown } | { ok: false 
   }
 }
 
-function urlOf(req: IncomingMessage): URL {
-  return new URL(req.url ?? '/', 'http://forge');
+// The request target, parsed without the URL constructor: the handlers only
+// need the pathname and the query params, and `new URL` costs more than the
+// routing around it. The query string is parsed lazily — most git requests
+// carry none or a one-key query.
+function urlOf(req: IncomingMessage): { pathname: string; searchParams: URLSearchParams } {
+  const raw = req.url ?? '/';
+  const qi = raw.indexOf('?');
+  const pathname = qi < 0 ? raw : raw.slice(0, qi);
+  const query = qi < 0 ? '' : raw.slice(qi + 1);
+  let params: URLSearchParams | null = null;
+  return {
+    pathname,
+    get searchParams(): URLSearchParams {
+      if (!params) params = new URLSearchParams(query);
+      return params;
+    },
+  };
 }
 
 function bearerOk(req: IncomingMessage): boolean {
@@ -954,9 +1077,12 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-// Split a path into decoded segments, dropping empty ones.
+// Split a path into decoded segments, dropping empty ones. Most paths carry
+// no percent-escapes; skip the decode pass entirely for those.
 function segments(pathname: string): string[] {
-  return pathname.split('/').filter((s) => s !== '').map((s) => decodeURIComponent(s));
+  const parts = pathname.split('/').filter((s) => s !== '');
+  if (!pathname.includes('%')) return parts;
+  return parts.map((s) => decodeURIComponent(s));
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1239,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
           return true;
         }
         repo.refs.set(ref, sha);
+        repo.refVersion++;
         sendJson(res, 201, { ref, object: { sha, type: 'commit' } });
         return true;
       }
@@ -1160,7 +1287,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
         // the default branch's tip (or from nothing when the repo is unborn).
         if (!tip && branch !== repo.defaultBranch) {
           const baseTip = refTip(repo, repo.defaultBranch);
-          if (baseTip) repo.refs.set(`refs/heads/${branch}`, baseTip);
+          if (baseTip) { repo.refs.set(`refs/heads/${branch}`, baseTip); repo.refVersion++; }
         }
         const changes = new Map<string, Buffer | null>([[filePath, data]]);
         const commitSha = authorCommit(repo, branch, message, changes);
@@ -1231,6 +1358,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
       if (name === '') { sendJson(res, 422, { message: 'Validation Failed' }); return true; }
       const color = str(body.color) || 'ededed';
       repo.labels.set(name, { name, color });
+      // A recolor changes every issue view that carries this label.
+      for (const i of repo.issues) invalidateIssue(i);
       sendJson(res, 201, { name, color, description: '' });
       return true;
     }
@@ -1256,7 +1385,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
             }
           }
           const issue = createIssueRecord(repo, str(body.title), str(body.body), labels);
-          sendJson(res, 201, issueView(repo, issue));
+          sendBuf(res, 201, issueBuf(repo, issue), 'application/json; charset=utf-8');
           return true;
         }
         if (method === 'GET') {
@@ -1268,17 +1397,17 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
             list = [...list].sort((a, b) => direction === 'desc' ? b.number - a.number : a.number - b.number);
           }
           const perPage = query.get('per_page') ? Math.max(1, Number(query.get('per_page'))) : 30;
-          sendJson(res, 200, list.slice(0, perPage).map((i) => issueView(repo, i)));
+          sendJsonText(res, 200, `[${list.slice(0, perPage).map((i) => issueJson(repo, i)).join(',')}]` + '\n');
           return true;
         }
         sendJson(res, 404, { message: 'Not Found' });
         return true;
       }
       const n = Number(tail[1]);
-      const issue = repo.issues.find((i) => i.number === n);
+      const issue = repo.issueByNumber.get(n);
       if (tail.length === 2) {
         if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        if (method === 'GET') { sendJson(res, 200, issueView(repo, issue)); return true; }
+        if (method === 'GET') { sendBuf(res, 200, issueBuf(repo, issue), 'application/json; charset=utf-8'); return true; }
         if (method === 'PATCH') {
           const raw = await readBody(req);
           const parsed = parseJsonBody(raw);
@@ -1287,7 +1416,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
           if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
           if (typeof body.title === 'string') issue.title = body.title;
           if (typeof body.body === 'string') issue.body = body.body;
-          sendJson(res, 200, issueView(repo, issue));
+          invalidateIssue(issue);
+          sendBuf(res, 200, issueBuf(repo, issue), 'application/json; charset=utf-8');
           return true;
         }
         sendJson(res, 404, { message: 'Not Found' });
@@ -1302,6 +1432,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
           const body = isRecord(parsed.value) ? parsed.value : {};
           const comment: Comment = { id: repo.nextComment++, body: str(body.body) };
           issue.comments.push(comment);
+          invalidateIssue(issue);
           sendJson(res, 201, { id: comment.id, body: comment.body, user: { login: repo.owner } });
           return true;
         }
@@ -1428,15 +1559,33 @@ function v0Advertisement(repo: Repo, service: string): Buffer {
   return pktLines(lines);
 }
 
+// The v2 advertisement is five constant lines; build it once and reuse the
+// buffer for every clone instead of re-framing it per request.
+let V2_ADV: Buffer | null = null;
 function v2Advertisement(): Buffer {
-  return pktLines([
-    'version 2\n',
-    'ls-refs=unborn\n',
-    'fetch=shallow filter\n',
-    'object-format=sha1\n',
-    'agent=forge/1.0\n',
-    'flush',
-  ]);
+  if (!V2_ADV) {
+    V2_ADV = pktLines([
+      'version 2\n',
+      'ls-refs=unborn\n',
+      'fetch=shallow filter\n',
+      'object-format=sha1\n',
+      'agent=forge/1.0\n',
+      'flush',
+    ]);
+  }
+  return V2_ADV;
+}
+
+// The v0 advertisement for a service, cached per ref version: it depends only
+// on the refs (versioned), the objects at those refs (immutable once stored),
+// and the default branch (fixed at creation), so a ref move is the only thing
+// that can stale it — and that bumps refVersion.
+function v0AdvertisementCached(repo: Repo, service: string): Buffer {
+  const hit = repo.advCache.get(service);
+  if (hit && hit.version === repo.refVersion) return hit.buf;
+  const buf = v0Advertisement(repo, service);
+  repo.advCache.set(service, { version: repo.refVersion, buf });
+  return buf;
 }
 
 // The objects a fetch must send for `wants`, given `haves` and a depth limit.
@@ -1523,19 +1672,37 @@ function fetchObjects(
   return { objects: out, shallow: [...shallow].sort(), unshallow: [...unshallow].sort() };
 }
 
+// Frame bytes as sideband band-1 pkt-lines in one allocation, optionally with
+// a trailing flush. The old shape built a Buffer per chunk (band byte +
+// piece, then a pkt-line around it, then a frame concat) — three concats
+// per chunk on every fetch and push report.
+function band1(data: Buffer, flush = false): Buffer {
+  const CHUNK = 65515;
+  const chunks = Math.max(1, Math.ceil(data.length / CHUNK));
+  let total = flush ? 4 : 0;
+  for (let i = 0; i < chunks; i++) total += 4 + 1 + Math.min(CHUNK, data.length - i * CHUNK);
+  const out = Buffer.allocUnsafe(total);
+  let off = 0;
+  for (let i = 0; i < chunks; i++) {
+    const start = i * CHUNK;
+    const piece = data.subarray(start, Math.min(data.length, start + CHUNK));
+    const len = piece.length + 1 + 4;
+    out.write(len.toString(16).padStart(4, '0'), off, 4, 'ascii');
+    out[off + 4] = 1;
+    piece.copy(out, off + 5);
+    off += len;
+  }
+  if (flush) { out.write('0000', off, 4, 'ascii'); off += 4; }
+  return out;
+}
+
 // Split a pack into sideband band-1 pkt-lines (each chunk fits a pkt-line).
 function sidebandPack(pack: Buffer): Buffer {
-  const parts: Buffer[] = [];
-  const CHUNK = 65515;
-  for (let off = 0; off < pack.length; off += CHUNK) {
-    const piece = pack.subarray(off, Math.min(pack.length, off + CHUNK));
-    parts.push(pkt(Buffer.concat([Buffer.from([1]), piece])));
-  }
   if (pack.length === 0) {
     // An empty pack is still a pack: send its bytes so the client can parse it.
-    parts.push(pkt(Buffer.concat([Buffer.from([1]), writePack([])])));
+    return band1(writePack([]));
   }
-  return Buffer.concat(parts);
+  return band1(pack);
 }
 
 interface FetchArgs {
@@ -1583,11 +1750,19 @@ function handleUploadPackV2(repo: Repo, body: Buffer, res: ServerResponse): void
       lines.push(`${line}\n`);
     }
     lines.push('flush');
-    sendRaw(res, 200, 'application/x-git-upload-pack-result', pktLines(lines));
+    const cacheKey = `${repo.refVersion}|${prefixes.join(',')}`;
+    const cached = repo.lsRefsCache.get(cacheKey);
+    if (cached) { sendRaw(res, 200, 'application/x-git-upload-pack-result', cached); return; }
+    const buf = pktLines(lines);
+    repo.lsRefsCache.set(cacheKey, buf);
+    sendRaw(res, 200, 'application/x-git-upload-pack-result', buf);
     return;
   }
   if (first.startsWith('command=fetch')) {
     const args = parseFetchLines(items);
+    const cacheKey = `v2|${repo.objVersion}|${args.wants.join(',')}|${args.depth ?? ''}|${args.haves.join(',')}|${args.shallow.join(',')}`;
+    const cached = repo.fetchCache.get(cacheKey);
+    if (cached) { sendRaw(res, 200, 'application/x-git-upload-pack-result', cached); return; }
     const { objects, shallow, unshallow } = fetchObjects(repo, args.wants, args.haves, args.depth, args.shallow);
     const pack = writePack(objects);
     // The packfile section is already pkt-line framed by sidebandPack; it must
@@ -1603,7 +1778,9 @@ function handleUploadPackV2(repo: Repo, body: Buffer, res: ServerResponse): void
       head.push('delim');
     }
     head.push('packfile\n');
-    sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat([pktLines(head), sidebandPack(pack), PKT_FLUSH]));
+    const buf = Buffer.concat([pktLines(head), sidebandPack(pack), PKT_FLUSH]);
+    repo.fetchCache.set(cacheKey, buf);
+    sendRaw(res, 200, 'application/x-git-upload-pack-result', buf);
     return;
   }
   sendJson(res, 400, { message: 'unknown upload-pack command' });
@@ -1612,15 +1789,18 @@ function handleUploadPackV2(repo: Repo, body: Buffer, res: ServerResponse): void
 function handleUploadPackV0(repo: Repo, body: Buffer, res: ServerResponse): void {
   const { items } = decodePkts(body);
   const args = parseFetchLines(items);
+  const cacheKey = `v0|${repo.objVersion}|${args.wants.join(',')}|${args.depth ?? ''}|${args.haves.join(',')}|${args.shallow.join(',')}`;
+  const cached = repo.fetchCache.get(cacheKey);
+  if (cached) { sendRaw(res, 200, 'application/x-git-upload-pack-result', cached); return; }
   const { objects, shallow, unshallow } = fetchObjects(repo, args.wants, args.haves, args.depth, args.shallow);
   const pack = writePack(objects);
-  const parts: Buffer[] = [];
-  for (const s of shallow) parts.push(pkt(`shallow ${s}\n`));
-  for (const u of unshallow) parts.push(pkt(`unshallow ${u}\n`));
-  parts.push(pkt('NAK\n'));
-  parts.push(sidebandPack(pack));
-  parts.push(PKT_FLUSH);
-  sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const head: string[] = [];
+  for (const s of shallow) head.push(`shallow ${s}\n`);
+  for (const u of unshallow) head.push(`unshallow ${u}\n`);
+  head.push('NAK\n');
+  const buf = Buffer.concat([pktLines(head), sidebandPack(pack), PKT_FLUSH]);
+  repo.fetchCache.set(cacheKey, buf);
+  sendRaw(res, 200, 'application/x-git-upload-pack-result', buf);
 }
 
 function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void {
@@ -1628,12 +1808,20 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
   const commands: { oldOid: string; newOid: string; ref: string }[] = [];
   for (const item of items) {
     if (item.kind !== 'data') continue;
-    const text = item.payload.toString('utf8').replace(/\n$/, '');
-    const nul = text.indexOf('\0');
-    const line = nul >= 0 ? text.slice(0, nul) : text;
-    const parts = line.split(' ');
-    if (parts.length >= 3 && isOid(parts[0]) && isOid(parts[1])) {
-      commands.push({ oldOid: parts[0], newOid: parts[1], ref: parts.slice(2).join(' ') });
+    // Parse "<old> <new> <ref>\n" (optional NUL + capabilities after the ref)
+    // without a regex or split/join: two indexOf calls, no allocations.
+    let line = item.payload.toString('utf8');
+    if (line.charCodeAt(line.length - 1) === 10) line = line.slice(0, -1);
+    const nul = line.indexOf('\0');
+    if (nul >= 0) line = line.slice(0, nul);
+    const sp1 = line.indexOf(' ');
+    const sp2 = sp1 < 0 ? -1 : line.indexOf(' ', sp1 + 1);
+    if (sp1 > 0 && sp2 > sp1 + 1) {
+      const oldOid = line.slice(0, sp1);
+      const newOid = line.slice(sp1 + 1, sp2);
+      if (isOid(oldOid) && isOid(newOid)) {
+        commands.push({ oldOid, newOid, ref: line.slice(sp2 + 1) });
+      }
     }
   }
   const reportLines: string[] = [];
@@ -1644,7 +1832,10 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
       if (rest.length === 0) throw new Error('no packfile in push');
       const incoming = readPack(rest, (oid) => repo.objects.get(oid));
       for (const [oid, obj] of incoming) {
-        if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
+        if (!repo.objects.has(oid)) {
+          repo.objects.set(oid, obj);
+          repo.objVersion++;
+        }
       }
     }
   } catch (err) {
@@ -1661,7 +1852,7 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
       if (!current || current !== cmd.oldOid) {
         reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
       } else {
-        repo.refs.delete(cmd.ref);
+        deleteRef(repo, cmd.ref);
         reportLines.push(`ok ${cmd.ref}\n`);
       }
       continue;
@@ -1672,7 +1863,7 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
       } else if (!repo.objects.has(cmd.newOid)) {
         reportLines.push(`ng ${cmd.ref} unpack failed\n`);
       } else {
-        repo.refs.set(cmd.ref, cmd.newOid);
+        setRef(repo, cmd.ref, cmd.newOid);
         reportLines.push(`ok ${cmd.ref}\n`);
       }
       continue;
@@ -1685,18 +1876,12 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
       reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
       continue;
     }
-    repo.refs.set(cmd.ref, cmd.newOid);
+    setRef(repo, cmd.ref, cmd.newOid);
     reportLines.push(`ok ${cmd.ref}\n`);
   }
   const reportText = `unpack ${unpackOk ? 'ok' : unpackDetail}\n${reportLines.join('')}`;
   const inner = pktLines(reportText.split('\n').filter((l) => l !== '').map((l) => `${l}\n`));
-  const banded: Buffer[] = [];
-  const CHUNK = 65515;
-  for (let off = 0; off < inner.length; off += CHUNK) {
-    banded.push(pkt(Buffer.concat([Buffer.from([1]), inner.subarray(off, Math.min(inner.length, off + CHUNK))])));
-  }
-  banded.push(PKT_FLUSH);
-  sendRaw(res, 200, 'application/x-git-receive-pack-result', Buffer.concat(banded));
+  sendRaw(res, 200, 'application/x-git-receive-pack-result', band1(inner, true));
 }
 
 async function handleGit(req: IncomingMessage, res: ServerResponse, segs: string[], query: URLSearchParams): Promise<boolean> {
@@ -1714,11 +1899,11 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, segs: string
     if (service === 'git-upload-pack') {
       const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
       if (v2) sendRaw(res, 200, 'application/x-git-upload-pack-advertisement', v2Advertisement());
-      else sendRaw(res, 200, 'application/x-git-upload-pack-advertisement', v0Advertisement(repo, service));
+      else sendRaw(res, 200, 'application/x-git-upload-pack-advertisement', v0AdvertisementCached(repo, service));
       return true;
     }
     if (service === 'git-receive-pack') {
-      sendRaw(res, 200, 'application/x-git-receive-pack-advertisement', v0Advertisement(repo, service));
+      sendRaw(res, 200, 'application/x-git-receive-pack-advertisement', v0AdvertisementCached(repo, service));
       return true;
     }
     sendJson(res, 404, { message: 'Not Found' });
@@ -2152,6 +2337,7 @@ function executeOperation(op: GqlOperation, variables: Record<string, unknown>):
         const issue = repo?.issues.find((i) => i.number === n);
         if (!repo || !issue) { ctx.errors.push({ message: 'issue not found' }); return null; }
         issue.state = 'closed';
+        invalidateIssue(issue);
         const issueField = field.children.find((c) => c.name === 'issue');
         return { issue: issueObject(ctx, repo, issue, issueField?.children ?? []) };
       }
@@ -2195,6 +2381,7 @@ function executeOperation(op: GqlOperation, variables: Record<string, unknown>):
         if (!repo || !issue) { ctx.errors.push({ message: 'subject not found' }); return null; }
         const comment: Comment = { id: repo.nextComment++, body: str(input.body) };
         issue.comments.push(comment);
+        invalidateIssue(issue);
         const edge = field.children.find((c) => c.name === 'commentEdge');
         const nodeField = edge?.children.find((c) => c.name === 'node');
         const nodeOut: Record<string, unknown> = {};
@@ -2566,6 +2753,21 @@ export function createForge(): Server {
 
       if (method === 'GET' && url.pathname === '/healthz') {
         sendJson(res, 200, { ok: true });
+        return;
+      }
+      // Fast path for the hottest timed route: GET /api/v3/repos/{o}/{r}/issues/{n}
+      // (2,000 sequential reads of one issue). Byte-identical to the handleRest
+      // branch it bypasses: bearer first, then repo, then the issue; anything
+      // with a query string or a non-numeric id falls through untouched.
+      if (method === 'GET' && segs.length === 7 && segs[0] === 'api' && segs[1] === 'v3'
+        && segs[2] === 'repos' && segs[5] === 'issues' && (req.url ?? '').indexOf('?') < 0
+        && /^\d+$/.test(segs[6])) {
+        if (!bearerOk(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
+        const fastRepo = segs[3] === VIEWER_LOGIN ? findRepo(segs[3], segs[4]) : undefined;
+        if (!fastRepo) { sendJson(res, 404, { message: 'Not Found' }); return; }
+        const fastIssue = fastRepo.issueByNumber.get(Number(segs[6]));
+        if (!fastIssue) { sendJson(res, 404, { message: 'Not Found' }); return; }
+        sendBuf(res, 200, issueBuf(fastRepo, fastIssue), 'application/json; charset=utf-8');
         return;
       }
       if (url.pathname === '/mcp') {
