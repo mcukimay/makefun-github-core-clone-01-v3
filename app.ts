@@ -124,7 +124,8 @@ const CODE_TYPE: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 
 
 function hashObj(type: ObjType, data: Buffer): string {
   const h = createHash('sha1');
-  h.update(Buffer.from(`${type} ${data.length}\0`, 'utf8'));
+  // update() takes the header as a string directly: no Buffer alloc per object.
+  h.update(`${type} ${data.length}\0`, 'utf8');
   h.update(data);
   return h.digest('hex');
 }
@@ -992,6 +993,9 @@ function createPullRecord(repo: Repo, title: string, body: string, head: string,
 
 let requestCounter = 0;
 const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+// The full header value, built once: bearerOk runs on every request, and a
+// template concat per request is pure waste.
+const EXPECTED_AUTH = `Bearer ${EXPECTED_TOKEN}`;
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
   sendJsonText(res, status, `${JSON.stringify(body)}\n`, extra);
@@ -1061,8 +1065,7 @@ function urlOf(req: IncomingMessage): { pathname: string; searchParams: URLSearc
 
 function bearerOk(req: IncomingMessage): boolean {
   if (EXPECTED_TOKEN === '') return true;
-  const header = req.headers.authorization ?? '';
-  return header === `Bearer ${EXPECTED_TOKEN}`;
+  return (req.headers.authorization ?? '') === EXPECTED_AUTH;
 }
 
 function str(v: unknown): string {
@@ -1736,6 +1739,13 @@ function handleUploadPackV2(repo: Repo, body: Buffer, res: ServerResponse): void
       if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
     }
     const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
+    // The cache lookup comes before building the reply: the old order built
+    // the whole line list (including a refs sort) on every call and only then
+    // checked the cache, so a hit still paid the build. The clone workload
+    // sends ls-refs fifty times per round on an unchanged repo.
+    const cacheKey = `${repo.refVersion}|${prefixes.join(',')}`;
+    const cached = repo.lsRefsCache.get(cacheKey);
+    if (cached) { sendRaw(res, 200, 'application/x-git-upload-pack-result', cached); return; }
     const lines: (string | 'flush')[] = [];
     const tip = refTip(repo, repo.defaultBranch);
     if (prefixes.length === 0) {
@@ -1750,9 +1760,6 @@ function handleUploadPackV2(repo: Repo, body: Buffer, res: ServerResponse): void
       lines.push(`${line}\n`);
     }
     lines.push('flush');
-    const cacheKey = `${repo.refVersion}|${prefixes.join(',')}`;
-    const cached = repo.lsRefsCache.get(cacheKey);
-    if (cached) { sendRaw(res, 200, 'application/x-git-upload-pack-result', cached); return; }
     const buf = pktLines(lines);
     repo.lsRefsCache.set(cacheKey, buf);
     sendRaw(res, 200, 'application/x-git-upload-pack-result', buf);
@@ -1879,8 +1886,9 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
     setRef(repo, cmd.ref, cmd.newOid);
     reportLines.push(`ok ${cmd.ref}\n`);
   }
-  const reportText = `unpack ${unpackOk ? 'ok' : unpackDetail}\n${reportLines.join('')}`;
-  const inner = pktLines(reportText.split('\n').filter((l) => l !== '').map((l) => `${l}\n`));
+  // Build the pkt-lines straight from the report lines: the old shape joined
+  // them into one string, split it back apart and re-suffixed every line.
+  const inner = pktLines([`unpack ${unpackOk ? 'ok' : unpackDetail}\n`, ...reportLines]);
   sendRaw(res, 200, 'application/x-git-receive-pack-result', band1(inner, true));
 }
 
@@ -2744,32 +2752,165 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 // The server
 // ---------------------------------------------------------------------------
 
-export function createForge(): Server {
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    try {
-      const url = urlOf(req);
-      const segs = segments(url.pathname);
-      const method = req.method ?? 'GET';
+// ---------------------------------------------------------------------------
+// Fast-path routing helpers (string ops, no split/decode/URLSearchParams)
+// ---------------------------------------------------------------------------
 
-      if (method === 'GET' && url.pathname === '/healthz') {
+// Split '/{owner}/{repo}.git/{tail}' into its parts; null when the shape
+// differs (the caller falls through to the generic router, which decodes and
+// answers 404 the same way). Owner and repo are single segments by
+// construction, so no segment can hide a '/'.
+function splitGitPath(pathname: string): { owner: string; name: string; tail: string } | null {
+  const firstSlash = pathname.indexOf('/', 1);
+  if (firstSlash < 1) return null;
+  const owner = pathname.slice(1, firstSlash);
+  const rest = pathname.slice(firstSlash + 1);
+  const slash = rest.indexOf('/');
+  if (slash < 0) return null;
+  const repoGit = rest.slice(0, slash);
+  if (!repoGit.endsWith('.git')) return null;
+  const name = repoGit.slice(0, -4);
+  if (owner === '' || name === '') return null;
+  return { owner, name, tail: rest.slice(slash + 1) };
+}
+
+// The `service` query param without building a URLSearchParams: the git
+// client sends exactly `service=<name>`, usually alone.
+function queryService(rawUrl: string): string {
+  const qi = rawUrl.indexOf('?');
+  if (qi < 0) return '';
+  const q = rawUrl.slice(qi + 1);
+  if (q.startsWith('service=')) {
+    const amp = q.indexOf('&');
+    return amp < 0 ? q.slice(8) : q.slice(8, amp);
+  }
+  for (const part of q.split('&')) {
+    if (part.startsWith('service=')) return part.slice(8);
+  }
+  return '';
+}
+
+// POST /api/v3/repos/{owner}/{repo}/issues, byte-identical to the handleRest
+// branch it bypasses: bearer first, repo 404 without draining the body,
+// 400 on malformed JSON, 422 on an unknown label, 201 with the cached issue.
+async function handleIssueCreateFast(req: IncomingMessage, res: ServerResponse, owner: string, name: string): Promise<void> {
+  if (!bearerOk(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
+  const repo = owner === VIEWER_LOGIN ? findRepo(owner, name) : undefined;
+  if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
+  const raw = await readBody(req);
+  const parsed = parseJsonBody(raw);
+  if (!parsed.ok) { sendJson(res, 400, { message: 'Problems parsing JSON' }); return; }
+  const body = isRecord(parsed.value) ? parsed.value : {};
+  const labels: string[] = [];
+  if (Array.isArray(body.labels)) {
+    for (const l of body.labels) {
+      const lname = typeof l === 'string' ? l : isRecord(l) ? str(l.name) : '';
+      if (lname === '') continue;
+      if (!repo.labels.has(lname)) {
+        sendJson(res, 422, { message: `Validation Failed: label "${lname}" does not exist` });
+        return;
+      }
+      labels.push(lname);
+    }
+  }
+  const issue = createIssueRecord(repo, str(body.title), str(body.body), labels);
+  sendBuf(res, 201, issueBuf(repo, issue), 'application/json; charset=utf-8');
+}
+
+export function createForge(): Server {
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    try {
+      const method = req.method ?? 'GET';
+      const rawUrl = req.url ?? '/';
+      const qi = rawUrl.indexOf('?');
+      const pathname = qi < 0 ? rawUrl : rawUrl.slice(0, qi);
+
+      if (method === 'GET' && pathname === '/healthz') {
         sendJson(res, 200, { ok: true });
         return;
       }
-      // Fast path for the hottest timed route: GET /api/v3/repos/{o}/{r}/issues/{n}
-      // (2,000 sequential reads of one issue). Byte-identical to the handleRest
-      // branch it bypasses: bearer first, then repo, then the issue; anything
-      // with a query string or a non-numeric id falls through untouched.
-      if (method === 'GET' && segs.length === 7 && segs[0] === 'api' && segs[1] === 'v3'
-        && segs[2] === 'repos' && segs[5] === 'issues' && (req.url ?? '').indexOf('?') < 0
-        && /^\d+$/.test(segs[6])) {
-        if (!bearerOk(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
-        const fastRepo = segs[3] === VIEWER_LOGIN ? findRepo(segs[3], segs[4]) : undefined;
-        if (!fastRepo) { sendJson(res, 404, { message: 'Not Found' }); return; }
-        const fastIssue = fastRepo.issueByNumber.get(Number(segs[6]));
-        if (!fastIssue) { sendJson(res, 404, { message: 'Not Found' }); return; }
-        sendBuf(res, 200, issueBuf(fastRepo, fastIssue), 'application/json; charset=utf-8');
-        return;
+
+      // Hot routes, matched on the raw pathname with indexOf/slice only: the
+      // generic router splits the path, decodes segments and builds a
+      // URLSearchParams per request, and the four timed workloads are nothing
+      // but these routes. Anything with a '%' falls through untouched, so an
+      // escaped path still gets the generic router's decoding.
+      if (!pathname.includes('%')) {
+        // GET /api/v3/repos/{owner}/{repo}/issues/{n} — the read workload's
+        // 2,000 sequential reads of one issue. Exactly seven segments, a
+        // numeric id, no query string; anything else falls through.
+        if (method === 'GET' && qi < 0 && pathname.startsWith('/api/v3/repos/')) {
+          const rest = pathname.slice(14);
+          const slash1 = rest.indexOf('/');
+          const issuesIdx = slash1 < 0 ? -1 : rest.indexOf('/issues/', slash1);
+          if (slash1 > 0 && issuesIdx > slash1 + 1) {
+            const repoPart = rest.slice(slash1 + 1, issuesIdx);
+            const numStr = rest.slice(issuesIdx + 8);
+            if (repoPart.indexOf('/') < 0 && numStr !== '' && numStr.indexOf('/') < 0 && /^\d+$/.test(numStr)) {
+              if (!bearerOk(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
+              const owner = rest.slice(0, slash1);
+              const fastRepo = owner === VIEWER_LOGIN ? findRepo(owner, repoPart) : undefined;
+              if (!fastRepo) { sendJson(res, 404, { message: 'Not Found' }); return; }
+              const fastIssue = fastRepo.issueByNumber.get(Number(numStr));
+              if (!fastIssue) { sendJson(res, 404, { message: 'Not Found' }); return; }
+              sendBuf(res, 200, issueBuf(fastRepo, fastIssue), 'application/json; charset=utf-8');
+              return;
+            }
+          }
+        }
+        // POST /api/v3/repos/{owner}/{repo}/issues — the write workload's
+        // 200 sequential creates. Exactly five segments, no query string.
+        if (method === 'POST' && qi < 0 && pathname.startsWith('/api/v3/repos/')) {
+          const rest = pathname.slice(14);
+          const slash1 = rest.indexOf('/');
+          const issuesIdx = slash1 < 0 ? -1 : rest.indexOf('/issues', slash1);
+          if (slash1 > 0 && issuesIdx === rest.length - 7 && issuesIdx > slash1 + 1) {
+            const repoPart = rest.slice(slash1 + 1, issuesIdx);
+            if (repoPart.indexOf('/') < 0) {
+              await handleIssueCreateFast(req, res, rest.slice(0, slash1), repoPart);
+              return;
+            }
+          }
+        }
+        // Git smart HTTP: GET .../info/refs and POST .../git-{upload,receive}-pack.
+        const git = splitGitPath(pathname);
+        if (git !== null) {
+          if (method === 'GET' && git.tail === 'info/refs') {
+            const service = queryService(rawUrl);
+            if (service === 'git-upload-pack' || service === 'git-receive-pack') {
+              const repo = git.owner === VIEWER_LOGIN ? findRepo(git.owner, git.name) : undefined;
+              if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
+              if (service === 'git-upload-pack') {
+                const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+                if (v2) sendRaw(res, 200, 'application/x-git-upload-pack-advertisement', v2Advertisement());
+                else sendRaw(res, 200, 'application/x-git-upload-pack-advertisement', v0AdvertisementCached(repo, service));
+              } else {
+                sendRaw(res, 200, 'application/x-git-receive-pack-advertisement', v0AdvertisementCached(repo, service));
+              }
+              return;
+            }
+          }
+          if (method === 'POST' && (git.tail === 'git-upload-pack' || git.tail === 'git-receive-pack')) {
+            const repo = git.owner === VIEWER_LOGIN ? findRepo(git.owner, git.name) : undefined;
+            if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
+            const body = await readBody(req);
+            try {
+              if (git.tail === 'git-upload-pack') {
+                if ((req.headers['git-protocol'] ?? '') === 'version=2') handleUploadPackV2(repo, body, res);
+                else handleUploadPackV0(repo, body, res);
+              } else {
+                handleReceivePack(repo, body, res);
+              }
+            } catch {
+              sendJson(res, 400, { message: 'Bad Request' });
+            }
+            return;
+          }
+        }
       }
+
+      const url = urlOf(req);
+      const segs = segments(url.pathname);
       if (url.pathname === '/mcp') {
         await handleMcp(req, res);
         return;
@@ -2805,4 +2946,11 @@ export function createForge(): Server {
       }
     }
   });
+  // Nagle's algorithm plus delayed ACKs can stall the small request/response
+  // pairs the timed workloads are made of; the suite's client is on the same
+  // loopback, so disable it on every connection.
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+  return server;
 }
